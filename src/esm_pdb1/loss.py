@@ -1,4 +1,4 @@
-"""Loss functions for triplet contrastive training."""
+"""Loss functions for contrastive training (siamese MSE and triplet)."""
 
 from __future__ import annotations
 
@@ -18,6 +18,35 @@ def _nanmean_losses(*losses: torch.Tensor) -> torch.Tensor:
     if not valid:
         return torch.tensor(float("nan"))
     return torch.stack(valid).mean()
+
+
+def siamese_mse_loss(
+    left_tokens: torch.Tensor,
+    right_tokens: torch.Tensor,
+    left_mask: torch.Tensor,
+    right_mask: torch.Tensor,
+    labels: torch.Tensor,
+) -> torch.Tensor:
+    """Siamese MSE loss matching AbLangPDB's ``siamese_mse_loss``.
+
+    Pools token-level embeddings, L2-normalises, computes cosine similarity
+    (dot product of unit vectors), then MSE against the label values
+    (-1, 0.2, or ≥0.5).
+
+    Args:
+        left_tokens: (B, N, D') token-level embeddings for the first antibody.
+        right_tokens: (B, N, D') token-level embeddings for the second antibody.
+        left_mask: (B, N) attention mask for the first antibody.
+        right_mask: (B, N) attention mask for the second antibody.
+        labels: (B,) target similarity values.
+
+    Returns:
+        Scalar MSE loss.
+    """
+    left_pooled = F.normalize(mean_pool(left_tokens, left_mask), p=2, dim=1)
+    right_pooled = F.normalize(mean_pool(right_tokens, right_mask), p=2, dim=1)
+    cosine_similarity = (left_pooled * right_pooled).sum(dim=1)
+    return _mse(cosine_similarity, labels)
 
 
 def triplet_loss(

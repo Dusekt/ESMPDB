@@ -1,4 +1,4 @@
-"""Data loading, tokenisation, and triplet dataset construction using Polars."""
+"""Data loading, tokenisation, and dataset construction (pairs and triplets) using Polars."""
 
 from __future__ import annotations
 
@@ -79,6 +79,111 @@ def load_antibody_data(
     )
 
     return df
+
+
+# ---------------------------------------------------------------------------
+# Pair Dataset (siamese MSE — matches AbLangPDB)
+# ---------------------------------------------------------------------------
+
+
+class PairDataset(Dataset):
+    """PyTorch dataset that yields (ab1, ab2, label) H-chain pairs.
+
+    Each item is a tuple of:
+        (h_ids_1, h_mask_1, h_ids_2, h_mask_2, label)
+    """
+
+    def __init__(
+        self,
+        h_ids: torch.Tensor,
+        h_mask: torch.Tensor,
+        pairs: torch.Tensor,
+        labels: torch.Tensor,
+    ) -> None:
+        self.h_ids = h_ids
+        self.h_mask = h_mask
+        self.pairs = pairs  # (N, 2)
+        self.labels = labels  # (N,)
+
+    def __len__(self) -> int:
+        return len(self.pairs)
+
+    def __getitem__(self, idx: int) -> tuple[torch.Tensor, ...]:
+        i, j = self.pairs[idx]
+        return (
+            self.h_ids[i],
+            self.h_mask[i],
+            self.h_ids[j],
+            self.h_mask[j],
+            self.labels[idx],
+        )
+
+
+def build_pair_dataloader(
+    df: pl.DataFrame,
+    pair_csv_path: Path,
+    dataset_name: str,
+    batch_size: int,
+    num_pairs_per_ab: int,
+    fix_labels: bool = False,
+) -> DataLoader:
+    """Build a balanced pair DataLoader, replicating AbLangPDB's sampling.
+
+    Balances across three label classes: negative (-1), same-antigen (0.2),
+    and overlapping-epitope (>=0.5). For each epoch, samples
+    ``len(dataset) * num_pairs_per_ab`` total pairs, balanced across classes.
+    """
+    cur_df = df.filter(pl.col("DATASET") == dataset_name)
+    column1_vals = cur_df["Column1"].to_list()
+    index_mapping = {v: i for i, v in enumerate(column1_vals)}
+
+    if fix_labels:
+        from esm_pdb1.label_qc import fix_mislabelled_pairs
+
+        pairs_df = fix_mislabelled_pairs(pair_csv_path)
+    else:
+        pairs_df = pl.read_csv(pair_csv_path)
+
+    pairs_df = pairs_df.select(["I", "J", "LABEL"])
+    valid_indices = set(index_mapping.keys())
+    pairs_df = pairs_df.filter(pl.col("I").is_in(valid_indices) & pl.col("J").is_in(valid_indices))
+
+    # Split by label class
+    pos_pairs = pairs_df.filter(pl.col("LABEL") > 0.49)  # overlapping epitope
+    med_pairs = pairs_df.filter(pl.col("LABEL") == 0.2)  # same antigen
+    neg_pairs = pairs_df.filter(pl.col("LABEL") == -1.0)  # negative
+
+    # Balance: sample same count from each class (anchored on #positives)
+    num_pos = len(pos_pairs)
+    if num_pos == 0:
+        log.warning("No positive pairs found for dataset '%s'.", dataset_name)
+        num_pos = min(len(med_pairs), len(neg_pairs))
+
+    med_sample = med_pairs.sample(min(num_pos, len(med_pairs)), shuffle=True)
+    neg_sample = neg_pairs.sample(min(num_pos, len(neg_pairs)), shuffle=True)
+
+    balanced = pl.concat([pos_pairs, med_sample, neg_sample])
+
+    # Subsample to target size
+    target_n = len(cur_df) * num_pairs_per_ab
+    if len(balanced) > target_n:
+        balanced = balanced.sample(target_n, shuffle=True)
+    elif len(balanced) < target_n:
+        # Oversample with replacement
+        extra = balanced.sample(target_n - len(balanced), with_replacement=True, shuffle=True)
+        balanced = pl.concat([balanced, extra])
+
+    # Remap indices and build tensors
+    mapped_i = [index_mapping[v] for v in balanced["I"].to_list()]
+    mapped_j = [index_mapping[v] for v in balanced["J"].to_list()]
+    pair_tensor = torch.tensor(list(zip(mapped_i, mapped_j)), dtype=torch.long)
+    label_tensor = torch.tensor(balanced["LABEL"].to_list(), dtype=torch.float32)
+
+    h_ids = torch.tensor(cur_df["H_INPUT_IDS"].to_list(), dtype=torch.long)
+    h_mask = torch.tensor(cur_df["H_ATTENTION_MASK"].to_list(), dtype=torch.bool)
+
+    ds = PairDataset(h_ids, h_mask, pair_tensor, label_tensor)
+    return DataLoader(ds, batch_size=batch_size, shuffle=True)
 
 
 # ---------------------------------------------------------------------------

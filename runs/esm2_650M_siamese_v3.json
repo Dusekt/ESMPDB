@@ -1,0 +1,21 @@
+{
+  "train": {
+    "run_name": "esm2_650M_siamese_v3",
+    "num_epochs": 500,
+    "batch_size": 4,
+    "eval_batch_size": 16,
+    "num_pairs_per_ab_per_epoch": 10,
+    "loss_type": "siamese_mse",
+    "learning_rate": 1e-5,
+    "use_scheduler": false,
+    "checkpoint_every": 20,
+    "fix_mislabelled_pairs": false
+  },
+  "model": {
+    "esm_model_name": "facebook/esm2_t33_650M_UR50D",
+    "projection_dim": 256,
+    "lora_r": 16,
+    "lora_alpha": 32,
+    "lora_dropout": 0.3
+  }
+}

@@ -13,6 +13,7 @@ from torch.optim.lr_scheduler import CosineAnnealingLR, OneCycleLR
 from esm_pdb1.config import Config
 from esm_pdb1.data import (
     build_eval_dataloader,
+    build_pair_dataloader,
     build_triplet_dataloader,
     embed_dataloader,
     load_antibody_data,
@@ -21,7 +22,7 @@ from esm_pdb1.evaluation import (
     binary_comparison_accuracy,
     nearest_neighbour_metrics,
 )
-from esm_pdb1.loss import cross_comparison, self_comparison, triplet_loss
+from esm_pdb1.loss import cross_comparison, self_comparison, siamese_mse_loss, triplet_loss
 from esm_pdb1.model import build_model
 
 logging.basicConfig(
@@ -223,7 +224,7 @@ def training_loop(
         import math
 
         total_steps = math.ceil(
-            tc.num_epochs * n_train * tc.num_triplets_per_ab_per_epoch / tc.batch_size
+            tc.num_epochs * n_train * tc.num_pairs_per_ab_per_epoch / tc.batch_size
         )
         if tc.scheduler_type == "cosine":
             scheduler = CosineAnnealingLR(optimizer, T_max=tc.num_epochs)
@@ -252,45 +253,86 @@ def training_loop(
         model.to(device)
         model.train()
 
-        triplet_dl = build_triplet_dataloader(
-            df,
-            pair_csv,
-            "TRAIN",
-            tc.batch_size,
-            tc.num_triplets_per_ab_per_epoch,
-            fix_labels=tc.fix_mislabelled_pairs,
-        )
-
-        for batch in triplet_dl:
-            step += 1
-            optimizer.zero_grad()
-
-            h_a, hm_a, h_p, hm_p, h_n, hm_n = (b.to(device) for b in batch)
-            tok_a = model(h_input_ids=h_a, h_attention_mask=hm_a)
-            tok_p = model(h_input_ids=h_p, h_attention_mask=hm_p)
-            tok_n = model(h_input_ids=h_n, h_attention_mask=hm_n)
-
-            loss = triplet_loss(
-                tok_a,
-                tok_p,
-                tok_n,
-                hm_a,
-                hm_p,
-                hm_n,
-                margin=tc.triplet_margin,
+        if tc.loss_type == "triplet":
+            triplet_dl = build_triplet_dataloader(
+                df,
+                pair_csv,
+                "TRAIN",
+                tc.batch_size,
+                tc.num_pairs_per_ab_per_epoch,
+                fix_labels=tc.fix_mislabelled_pairs,
             )
-            cur_loss = loss.item()
-            all_losses.append(cur_loss)
 
-            loss.backward()
-            optimizer.step()
-            if scheduler and tc.scheduler_type != "cosine":
-                scheduler.step()
+            for batch in triplet_dl:
+                step += 1
+                optimizer.zero_grad()
 
-            if step % 50 == 0:
-                log.info(
-                    "Epoch %d  step %d  loss=%.4f  (%.1fs)", epoch, step, cur_loss, time() - t0
+                h_a, hm_a, h_p, hm_p, h_n, hm_n = (b.to(device) for b in batch)
+                tok_a = model(h_input_ids=h_a, h_attention_mask=hm_a)
+                tok_p = model(h_input_ids=h_p, h_attention_mask=hm_p)
+                tok_n = model(h_input_ids=h_n, h_attention_mask=hm_n)
+
+                loss = triplet_loss(
+                    tok_a,
+                    tok_p,
+                    tok_n,
+                    hm_a,
+                    hm_p,
+                    hm_n,
+                    margin=tc.triplet_margin,
                 )
+                cur_loss = loss.item()
+                all_losses.append(cur_loss)
+
+                loss.backward()
+                optimizer.step()
+                if scheduler and tc.scheduler_type != "cosine":
+                    scheduler.step()
+
+                if step % 50 == 0:
+                    log.info(
+                        "Epoch %d  step %d  loss=%.4f  (%.1fs)",
+                        epoch,
+                        step,
+                        cur_loss,
+                        time() - t0,
+                    )
+        else:
+            # Siamese MSE (pair-based, matches AbLangPDB)
+            pair_dl = build_pair_dataloader(
+                df,
+                pair_csv,
+                "TRAIN",
+                tc.batch_size,
+                tc.num_pairs_per_ab_per_epoch,
+                fix_labels=tc.fix_mislabelled_pairs,
+            )
+
+            for batch in pair_dl:
+                step += 1
+                optimizer.zero_grad()
+
+                h1, hm1, h2, hm2, labels = (b.to(device) for b in batch)
+                tok1 = model(h_input_ids=h1, h_attention_mask=hm1)
+                tok2 = model(h_input_ids=h2, h_attention_mask=hm2)
+
+                loss = siamese_mse_loss(tok1, tok2, hm1, hm2, labels)
+                cur_loss = loss.item()
+                all_losses.append(cur_loss)
+
+                loss.backward()
+                optimizer.step()
+                if scheduler and tc.scheduler_type != "cosine":
+                    scheduler.step()
+
+                if step % 50 == 0:
+                    log.info(
+                        "Epoch %d  step %d  loss=%.4f  (%.1fs)",
+                        epoch,
+                        step,
+                        cur_loss,
+                        time() - t0,
+                    )
 
         # Per-epoch scheduler step for CosineAnnealingLR
         if scheduler and tc.scheduler_type == "cosine":

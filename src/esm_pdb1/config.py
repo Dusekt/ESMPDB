@@ -52,7 +52,11 @@ class TrainConfig(BaseModel):
     batch_size: int = 16
     eval_batch_size: int = 64
     num_epochs: int = 500
-    num_triplets_per_ab_per_epoch: int = 10
+    num_pairs_per_ab_per_epoch: int = 10
+    loss_type: str = Field(
+        default="siamese_mse",
+        description="Training loss type: 'siamese_mse' or 'triplet'.",
+    )
     learning_rate: float = 1e-5
     weight_decay: float = 0.0
     triplet_margin: float = 1.0
@@ -69,7 +73,7 @@ class TrainConfig(BaseModel):
     ag_thresh: float = 0.2
     ep_thresh: float = 0.5
     checkpoint_every: int = 20
-    fix_mislabelled_pairs: bool = True
+    fix_mislabelled_pairs: bool = False
     output_dir: Path = Field(default=Path("outputs"))
 
 
