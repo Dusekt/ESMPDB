@@ -1,6 +1,6 @@
 # ESM_PDB1
 
-Contrastive antibody embedding model using **ESM-2** as the protein language model backbone, fine-tuned with **LoRA** on SAbDab structural pairing data.  A re-implementation of the AbLangPDB1 training pipeline with a cleaner repo structure, Polars for data handling, and UV for dependency management.
+Contrastive antibody embedding model using **ESM-2** as the protein language model backbone, fine-tuned with **LoRA** on SAbDab structural pairing data.  Heavy-chain only, with a token-wise linear projection and triplet loss — producing residue-level embeddings at inference.
 
 ---
 
@@ -33,9 +33,9 @@ ESM_PDB1/
 │       └── {train_test,train_val}_label_mat_240730.pt  # Cross-comparison label matrices
 └── src/esm_pdb1/
     ├── config.py       # Pydantic configuration (DataConfig, ModelConfig, TrainConfig)
-    ├── data.py         # Polars-based data loading, ESM-2 tokenisation, PairDataset
-    ├── model.py        # ESM2Embedder (dual-chain ESM-2 + Mixer MLP) with LoRA
-    ├── loss.py         # Siamese MSE loss, self/cross comparison evaluation losses
+    ├── data.py         # Polars-based data loading, ESM-2 tokenisation, TripletDataset
+    ├── model.py        # ESM2Embedder (H-chain ESM-2 + token-wise projection) with LoRA
+    ├── loss.py         # Triplet loss with mean pooling, self/cross comparison evaluation losses
     ├── evaluation.py   # Binary accuracy sweep, nearest-neighbour metrics, F1
     ├── label_qc.py     # Detection & correction of ~0.1 % mislabelled pairs
     └── train.py        # Training loop + CLI entry point
@@ -46,32 +46,36 @@ ESM_PDB1/
 ## Architecture
 
 ```
-  Heavy chain AA ──► ESM-2 ──► [CLS] embedding (1 280-d) ─┐
-                                                           ├─► concat (2 560-d) ──► Mixer MLP ──► L2 normalise ──► embedding
-  Light chain AA ──► ESM-2 ──► [CLS] embedding (1 280-d) ─┘
+  Heavy chain AA ──► ESM-2 + LoRA ──► (B, N, 1280) ──► Linear(1280, D') ──► (B, N, D')
+                                                                                │
+                                                          ┌─────── training ────┘──── inference ──────┐
+                                                          │                                           │
+                                                   mean(dim=1)                              raw (B, N, D')
+                                                          │                              residue-level output
+                                                   L2 normalise
+                                                          │
+                                                   Triplet Loss
 ```
 
-- **Backbone**: ESM-2 (`facebook/esm2_t33_650M_UR50D`, 650 M params). A single ESM-2 model is shared for both heavy and light chains — each chain is processed independently.
-- **Pooling**: By default the `[CLS]` token embedding is used. Alternatively, mean-pooling over residue positions (excluding special tokens) can be enabled via `use_cls: false`.
-- **Mixer**: A 6-layer feedforward MLP (Linear → ReLU × 5, then Linear) mapping the concatenated 2 560-d vector back to 2 560-d. Keeps the embedding dimension constant.
-- **LoRA**: Only a small subset of parameters are trained. LoRA adapters (default r=16, α=32) are applied to the `query` and `key` projections in ESM-2's attention layers, plus the even-numbered Mixer linear layers. This gives ~2 % trainable parameters.
-- **Output**: The final embedding is L2-normalised, so cosine similarity = dot product.
+- **Backbone**: ESM-2 (`facebook/esm2_t33_650M_UR50D`, 650 M params). Heavy chain only.
+- **Token-wise projection**: A shared `Linear(D, D')` layer transforms each residue vector (default D=1280 → D'=256).
+- **LoRA**: LoRA adapters (default r=16, α=32) are applied to the `query` and `key` projections in ESM-2's attention layers. The projection layer is trained directly (full gradient).
+- **Output**: Residue-level tensor `(B, N, D')`. During training, mean-pooling and L2-normalisation happen inside the loss function. At inference, the full token-level tensor is the output.
 
 ### Training objective
 
-Siamese contrastive learning with MSE loss.  Each training step samples a pair of antibodies and computes:
+Triplet contrastive learning.  Each training step samples an (anchor, positive, negative) triplet:
 
-$$\mathcal{L} = \text{MSE}\bigl(\cos(\mathbf{e}_a, \mathbf{e}_b),\; y\bigr)$$
+$$\mathcal{L} = \max\bigl(d(\mathbf{a}, \mathbf{p}) - d(\mathbf{a}, \mathbf{n}) + m,\; 0\bigr)$$
 
-where $y$ is the structural similarity label:
+where $d$ is Euclidean distance on mean-pooled, L2-normalised embeddings and $m$ is the margin (default 1.0).
 
-| Label | Meaning |
-|-------|---------|
-| −1.0 | Different antigen family (PFAM) |
-| 0.2 | Same antigen, different epitope |
-| ≥ 0.5 | Overlapping epitope (value = rBSA overlap score) |
+Triplet formation from the pair CSV:
 
-Pairs are balanced each epoch: equal counts of negative, same-antigen, and overlapping-epitope pairs.
+| Pair type | Label range | Role |
+|-----------|-------------|------|
+| Different antigen family | −1.0 | Negative |
+| Same antigen / overlapping epitope | ≥ 0.2 | Positive |
 
 ---
 
@@ -110,10 +114,12 @@ All settings are controlled via a JSON file passed with `--config`. Any field ca
     "num_epochs": 200,
     "batch_size": 16,
     "learning_rate": 1e-5,
+    "triplet_margin": 1.0,
     "checkpoint_every": 20
   },
   "model": {
     "esm_model_name": "facebook/esm2_t33_650M_UR50D",
+    "projection_dim": 256,
     "lora_r": 16,
     "lora_alpha": 32
   }
@@ -126,13 +132,13 @@ Key fields:
 |-------|---------|-------------|
 | `train.run_name` | `"default"` | Name for the run — output goes to `outputs/<run_name>/` |
 | `train.num_epochs` | 500 | Number of training epochs |
-| `train.batch_size` | 16 | Batch size for pair training |
+| `train.batch_size` | 16 | Batch size for triplet training |
 | `train.learning_rate` | 1e-5 | AdamW learning rate |
+| `train.triplet_margin` | 1.0 | Margin for triplet loss |
 | `train.checkpoint_every` | 20 | Save model checkpoint every N epochs |
 | `train.fix_mislabelled_pairs` | true | Correct the ~0.1 % mislabelled pairs at load time |
 | `model.esm_model_name` | `facebook/esm2_t33_650M_UR50D` | HuggingFace model ID |
-| `model.use_cls` | true | `true` = CLS pooling, `false` = mean pooling |
-| `model.add_mixer` | true | Whether to include the MLP projection head |
+| `model.projection_dim` | 256 | Output dimension D' of the token-wise linear projection |
 | `model.lora_r` | 16 | LoRA rank |
 
 ---

@@ -1,0 +1,13 @@
+{
+  "train": {
+    "run_name": "test_1epoch",
+    "num_epochs": 1,
+    "batch_size": 4,
+    "eval_batch_size": 16,
+    "checkpoint_every": 1
+  },
+  "model": {
+    "esm_model_name": "facebook/esm2_t33_650M_UR50D",
+    "projection_dim": 256
+  }
+}

@@ -1,0 +1,22 @@
+{
+  "train": {
+    "run_name": "esm2_650M_triplet_v1",
+    "num_epochs": 100,
+    "batch_size": 4,
+    "eval_batch_size": 16,
+    "num_triplets_per_ab_per_epoch": 3,
+    "learning_rate": 1e-5,
+    "triplet_margin": 1.0,
+    "use_scheduler": true,
+    "scheduler_max_lr": 5e-4,
+    "checkpoint_every": 10,
+    "fix_mislabelled_pairs": true
+  },
+  "model": {
+    "esm_model_name": "facebook/esm2_t33_650M_UR50D",
+    "projection_dim": 256,
+    "lora_r": 16,
+    "lora_alpha": 32,
+    "lora_dropout": 0.3
+  }
+}
